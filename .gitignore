@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime config (window position / pin state / theme — auto-saved by the GUI)
+dock_web_config.json
+
+# Full-resolution screenshot backup (README uses screenshot.jpg)
+screenshot.png
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

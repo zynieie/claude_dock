@@ -1,0 +1,227 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --accent: 130,195,255;
+    --bg: #1b1b20;          /* 背景色, 可右键设置(默认深色) */
+    --fg: #f2f2f7;          /* 字体色, 可右键设置 */
+    --scale: 1;             /* 卡片+字体等比缩放, 可右键设置 */
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { background: var(--bg); overflow: hidden;
+               font-family: 'Microsoft YaHei UI','Segoe UI',sans-serif; user-select:none; }
+  #cards { perspective: 900px;
+           padding: calc(4px*var(--scale)) calc(10px*var(--scale)) calc(10px*var(--scale));
+           display:flex; flex-direction:column; gap: calc(10px*var(--scale)); }
+
+  .card {
+    position: relative; height: calc(60px * var(--scale)); border-radius: calc(14px*var(--scale));
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.06);
+    transform-style: preserve-3d;
+    transition: transform .28s cubic-bezier(.2,.8,.25,1), box-shadow .25s, background .2s;
+    will-change: transform; cursor: pointer;
+  }
+  .card::before {                       /* 光斑: 跟随光标 */
+    content:''; position:absolute; inset:0; border-radius: calc(14px*var(--scale));
+    background: radial-gradient(calc(190px*var(--scale)) circle at var(--mx,50%) var(--my,50%),
+                rgba(var(--accent),0.24), rgba(var(--accent),0) 62%);
+    opacity:0; transition:opacity .2s; pointer-events:none;
+  }
+  .card:hover {
+    background: rgba(255,255,255,0.10);
+    box-shadow: 0 16px 34px rgba(0,0,0,.5), 0 0 0 1px rgba(var(--accent),0.35) inset;
+  }
+  .card:hover::before { opacity:1; }
+
+  /* 滚轮选中: 只做轻高亮, 不做大形变 */
+  .card.sel {
+    background: rgba(255,255,255,0.11);
+    box-shadow: 0 0 0 1px rgba(var(--accent),0.5) inset, 0 8px 22px rgba(0,0,0,.42);
+  }
+
+  .inner {
+    position:relative; height:100%; padding: calc(8px*var(--scale)) calc(12px*var(--scale));
+    display:flex; flex-direction:column; justify-content:center;
+    transform: translateZ(calc(26px*var(--scale)));
+  }
+  .row1 { display:flex; align-items:center; gap: calc(9px*var(--scale)); min-width:0; }
+  .badge { width:calc(24px*var(--scale)); height:calc(24px*var(--scale));
+           border-radius:calc(12px*var(--scale)); background:#0a84ff; color:#fff;
+           font-weight:700; font-size:calc(12px*var(--scale));
+           display:flex; align-items:center; justify-content:center; flex:0 0 auto; }
+
+  /* 标题跑马灯: 溢出才滚动, 缓入缓出 + 两端停顿 */
+  .title { flex:1 1 auto; min-width:0; overflow:hidden; white-space:nowrap; }
+  .title .txt { display:inline-block; color: var(--fg);
+                font-size: calc(13px*var(--scale)); font-weight:600; will-change:transform; }
+  .title.scroll .txt { animation: marq var(--dur, 4s) ease-in-out infinite; }
+  @keyframes marq {
+    0%, 16%  { transform: translateX(0); }
+    50%, 66% { transform: translateX(var(--shift, 0)); }
+    100%     { transform: translateX(0); }
+  }
+
+  .dot { width:calc(10px*var(--scale)); height:calc(10px*var(--scale));
+         border-radius:50%; flex:0 0 auto; box-shadow:0 0 8px currentColor; }
+  .row2 { display:flex; align-items:center; margin-top: calc(3px*var(--scale));
+          padding-left: calc(33px*var(--scale)); font-size: calc(10px*var(--scale)); }
+  .pid { color: var(--fg); opacity:.55; white-space:nowrap; }
+  .metric { margin-left:auto; display:flex; align-items:center; gap: calc(7px*var(--scale));
+            white-space:nowrap; flex:0 0 auto; }
+  .tok { color: rgb(100,210,255); font-weight:700; }
+
+  /* 右下角极小版本号 */
+  #ver { position:absolute; right:7px; bottom:3px; font-size:9px;
+         color: var(--fg); opacity:.28; pointer-events:none; letter-spacing:.3px;
+         font-family: 'Segoe UI', sans-serif; }
+</style>
+</head>
+<body>
+  <div id="cards"></div>
+  <div id="ver">V2.7</div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    let bridge = null;
+    try { new QWebChannel(qt.webChannelTransport, ch => { bridge = ch.objects.bridge; }); }
+    catch (e) {}
+
+    document.addEventListener('contextmenu', e => {   // 右键 -> Python 设置菜单
+      e.preventDefault();
+      if (bridge && bridge.menu) bridge.menu();
+    });
+
+    const root = document.documentElement;
+    window.setStyle = function (bg, fg, scale, font) {
+      if (bg) root.style.setProperty('--bg', bg);
+      if (fg) root.style.setProperty('--fg', fg);
+      if (scale) root.style.setProperty('--scale', scale);
+      if (font) {
+        // 全坞统一字体(卡片内文字)
+        document.querySelectorAll('.title .txt, .pid, .metric, .badge').forEach(el => {
+          el.style.fontFamily = "'" + font.replace(/\\'/g, "'") + "', 'Microsoft YaHei UI', sans-serif";
+        });
+      }
+      requestAnimationFrame(() => nodes.forEach(el =>
+        applyMarquee(el.querySelector('.title'))));
+    };
+
+    // ---- 跑马灯 ----
+    function applyMarquee(titleEl) {
+      if (!titleEl) return;
+      const txt = titleEl.querySelector('.txt');
+      const over = Math.round(txt.offsetWidth - titleEl.clientWidth);
+      const want = over > 2 ? over : 0;
+      if (titleEl._mq === want) return;
+      titleEl._mq = want;
+      if (want > 0) {
+        titleEl.style.setProperty('--shift', (-(want) - 6) + 'px');
+        titleEl.style.setProperty('--dur', (want * 26 + 2800) + 'ms');
+        titleEl.classList.add('scroll');
+      } else {
+        titleEl.classList.remove('scroll');
+        titleEl.style.removeProperty('--shift');
+      }
+    }
+    const ro = new ResizeObserver(entries => {
+      for (const en of entries) {
+        const titleEl = en.target.closest('.title');
+        if (titleEl) applyMarquee(titleEl);
+      }
+    });
+
+    const cards = document.getElementById('cards');
+    const nodes = new Map();
+    const pctColor = p => p >= 90 ? '#ff453a' : p >= 70 ? '#f5a623' : '#3ddc84';
+    const fmt = n => !n ? '' : n >= 1e6 ? (n/1e6).toFixed(2)+'M'
+                      : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : ''+n;
+
+    // ---- 滚轮切换窗口: 上至1 / 下至尾, 仅悬停在卡片上生效, 轻高亮 + 落定显示该窗口 ----
+    let selIdx = null, focusTimer = null;
+    function selectIdx(idx) {
+      const list = [...cards.children];
+      if (!list.length) return;
+      idx = Math.max(0, Math.min(list.length - 1, idx));
+      selIdx = idx;
+      list.forEach((c, i) => c.classList.toggle('sel', i === idx));
+      const hwnd = list[idx].dataset.hwnd;
+      clearTimeout(focusTimer);
+      focusTimer = setTimeout(() => { if (bridge && hwnd) bridge.jump('' + hwnd); }, 140);
+    }
+    document.addEventListener('wheel', e => {
+      const card = e.target.closest('.card');
+      if (!card) return;                       // 只有滚轮落在卡片上才生效
+      e.preventDefault();
+      const list = [...cards.children];
+      if (selIdx === null) selIdx = list.indexOf(card);   // 从当前悬停卡起步
+      selectIdx(selIdx + (e.deltaY < 0 ? -1 : 1));        // 上->往1, 下->往尾
+    }, { passive: false });
+    cards.addEventListener('mouseleave', () => {          // 离开坞: 复位选择与高亮
+      selIdx = null;
+      clearTimeout(focusTimer);
+      [...cards.children].forEach(c => c.classList.remove('sel'));
+    });
+
+    function makeCard() {
+      const el = document.createElement('div');
+      el.className = 'card';
+      el.innerHTML = `<div class="inner">
+          <div class="row1"><div class="badge"></div>
+            <div class="title"><span class="txt"></span></div><div class="dot"></div></div>
+          <div class="row2"><span class="pid"></span>
+            <span class="metric"><span class="tok"></span><span class="pct"></span></span></div>
+        </div>`;
+      el.addEventListener('mousemove', e => {          // 3D 倾斜 + 光斑跟随
+        const r = el.getBoundingClientRect();
+        const px = (e.clientX - r.left) / r.width;
+        const py = (e.clientY - r.top) / r.height;
+        const rx = (0.5 - py) * 9, ry = (px - 0.5) * 13;
+        el.style.transform = `rotateX(${rx}deg) rotateY(${ry}deg) scale(1.035)`;
+        el.style.setProperty('--mx', px * 100 + '%');
+        el.style.setProperty('--my', py * 100 + '%');
+      });
+      el.addEventListener('mouseleave', () => { el.style.transform = ''; });
+      el.addEventListener('click', () => { if (bridge) bridge.jump('' + el.dataset.hwnd); });
+      const titleEl = el.querySelector('.title');
+      ro.observe(titleEl);
+      ro.observe(titleEl.querySelector('.txt'));
+      return el;
+    }
+
+    window.setSessions = function (list) {
+      const seen = new Set();
+      list.forEach((s) => { seen.add(s.hwnd); });
+      for (const [hwnd, el] of nodes) {       // 删掉已关闭的, 不动已有顺序
+        if (!seen.has(hwnd)) { el.remove(); nodes.delete(hwnd); }
+      }
+      list.forEach((s) => {
+        let el = nodes.get(s.hwnd);
+        if (!el) {                             // 新窗口 -> 追加到末尾, 不乱序
+          el = makeCard();
+          nodes.set(s.hwnd, el);
+          cards.appendChild(el);
+        }
+        updateData(el, s);                     // 只更新内容, 不移动位置
+      });
+      renumber();                              // 重编 badge
+    };
+    function renumber() { [...cards.children].forEach((c, i) => { c.querySelector('.badge').textContent = i + 1; }); }
+    function updateData(el, s) {
+      el.dataset.hwnd = s.hwnd;
+      const txt = el.querySelector('.title .txt');
+      if (txt.textContent !== s.clean) { txt.textContent = s.clean; applyMarquee(el.querySelector('.title')); }
+      const busy = s.status === 'busy';
+      const dot = el.querySelector('.dot');
+      dot.style.background = busy ? '#f5a623' : '#3ddc84';
+      dot.style.color = busy ? '#f5a623' : '#3ddc84';
+      el.querySelector('.pid').textContent = (busy ? '● 运行' : '○ 空闲') + ' · PID ' + s.pid;
+      const tok = fmt(s.ctxtok);
+      el.querySelector('.tok').textContent = tok ? tok + ' tokens' : '';
+      const pct = el.querySelector('.pct');
+      if (s.ctx != null) { pct.textContent = s.ctx + '%'; pct.style.color = pctColor(s.ctx); } else pct.textContent = '';
+    }
+  </script>
+</body>
+</html>
