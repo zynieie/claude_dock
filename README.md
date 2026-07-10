@@ -2,7 +2,6 @@
 
 A small Windows floating dock I put together for myself, for counting and quickly switching between the Claude Code windows I have open. This is the **Web 3D** branch — the front-end is rendered by QtWebEngine (HTML/CSS), with the data side coming from the Python scanner in `python坞V1.08`. Personally I find it quite handy to use; when I have 6–8 sessions running, Alt-Tab gets old fast.
 
-![screenshot](screenshot.jpg)
 
 ## What it does
 
