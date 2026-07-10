@@ -53,7 +53,7 @@ MIT. See `LICENSE` if/when it's included — for now, do whatever you want with 
 
 ---
 
-## 中文说明（给国内朋友）
+## 中文说明
 
 这是 `claude_dock` 的 **Web 3D 版**，基于 PySide6 + QtWebEngine。`python坞V1.08` 负责扫窗口拿数据，网页负责把卡片画得漂亮。
 
