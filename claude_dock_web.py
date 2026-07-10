@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Claude Code 悬浮收纳坞 · Web 3D 版 (web坞V2.7)
+Claude Code 悬浮收纳坞 · Web 3D 版 (web坞V2.8)
 =============================================
-相对 V2.6:
-  - 右键菜单新增"字体…": 选全坞统一字体(应用卡片标题/PID/token/badge等)
-  - 右键标题栏 → 打开本坞所在项目文件夹
-  - 右下角极小版本号标志 V2.7
-继承: 顺序固定 / 高DPI / DWM圆角 / 滚轮切换 / 标题跑马灯 / 右键设置(背景色·字体色·大小)
+相对 V2.7:
+  - 卡片坞内拖拽重排: 长按拖动, 抬起幽灵卡片 + 蓝色插入线, 松手即时换位
+  - 卡片拖出坞: 卡片"消失", Python 16ms 心跳把对应 Claude 窗口实时跟手; 松手停在落点
+    拖回坞内则停止跟手, 卡片"复活"留在原位
+继承: 顺序固定 / 高DPI / DWM圆角 / 滚轮切换 / 标题跑马灯 / 右键设置 / 字体 / 右键标题开文件夹
 """
 import sys
 import os
@@ -48,13 +48,18 @@ from PySide6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QVBoxLayou
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QObject, Slot, QUrl
-from PySide6.QtGui import QColor, QCursor, QFont
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication
 
 
 class Bridge(QObject):
     """网页 -> Python 的回调桥。"""
     menuRequested = Signal()
     openFolderRequested = Signal()
+    dragStartSig = Signal(int, int, int)
+    dragOutsideSig = Signal(int, int, int)
+    dragReturnSig = Signal()
+    dragEndSig = Signal(bool, int, int)
+    dragDropSig = Signal(int, int, int)
 
     @Slot(str)
     def jump(self, hwnd):
@@ -70,6 +75,26 @@ class Bridge(QObject):
     @Slot()
     def openFolder(self):
         self.openFolderRequested.emit()
+
+    @Slot(int, int, int)
+    def dragStart(self, hwnd, x, y):
+        self.dragStartSig.emit(int(hwnd), int(x), int(y))
+
+    @Slot(int, int, int)
+    def dragOutside(self, hwnd, x, y):
+        self.dragOutsideSig.emit(int(hwnd), int(x), int(y))
+
+    @Slot()
+    def dragReturn(self):
+        self.dragReturnSig.emit()
+
+    @Slot(bool, int, int)
+    def dragEnd(self, in_dock, x, y):
+        self.dragEndSig.emit(bool(in_dock), int(x), int(y))
+
+    @Slot(int, int, int)
+    def dragDrop(self, hwnd, x, y):
+        self.dragDropSig.emit(int(hwnd), int(x), int(y))
 
 
 class ScanWorker(QThread):
@@ -165,6 +190,11 @@ class Dock(QWidget):
         self.bridge = Bridge()
         self.bridge.menuRequested.connect(self.open_settings)
         self.bridge.openFolderRequested.connect(self.open_folder)
+        self.bridge.dragStartSig.connect(self._drag_start)
+        self.bridge.dragOutsideSig.connect(self._drag_outside)
+        self.bridge.dragReturnSig.connect(self._drag_return)
+        self.bridge.dragDropSig.connect(self._drag_drop)
+        self.bridge.dragEndSig.connect(self._drag_end)
         self.channel.registerObject('bridge', self.bridge)
         self._font = self.cfg.get('font', '')
         self.view.page().setWebChannel(self.channel)
@@ -322,6 +352,67 @@ class Dock(QWidget):
         self.setWindowFlags(f)
         self.pin_btn.setText('📌' if self.pinned else '📍')
         self.show()
+
+    # ---- 卡片拖出坞: Python 接管, 16ms 心跳跟手 claude 窗口 ----
+    def _drag_start(self, hwnd, x, y):
+        self._drag_hwnd = int(hwnd)
+        self._drag_offset = (int(x), int(y))            # 鼠标点对窗口左上角的初始偏移
+        # 让坞不抢前台, 但保持置顶视觉(不被遮挡)
+        try:
+            # SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER = 0x0005
+            user32.SetWindowPos(int(hwnd), 0, int(x) - 80, int(y) - 20, 0, 0, 0x0005)
+        except Exception:
+            pass
+
+    def _drag_outside(self, hwnd, x, y):
+        # 启动 16ms 跟手定时器
+        if not hasattr(self, '_drag_timer') or self._drag_timer is None:
+            self._drag_timer = QTimer(self)
+            self._drag_timer.timeout.connect(self._drag_follow)
+        if not self._drag_timer.isActive():
+            self._drag_timer.start(16)
+        self._drag_hwnd = int(hwnd)
+        # 记录偏移: 鼠标相对于窗口客户区的位置(这样拖出去时窗口不会跳)
+        try:
+            r = RECT(); user32.GetWindowRect(hwnd, ctypes.byref(r))
+            self._drag_offset = (int(x) - r.left, int(y) - r.top)
+            # 立刻把小窗口尺寸保存下来, 之后只移动不重新设尺寸
+            self._drag_wh = (r.right - r.left, r.bottom - r.top)
+        except Exception:
+            self._drag_offset = (40, 20)
+            self._drag_wh = (800, 480)
+        self._drag_follow()
+
+    def _drag_follow(self):
+        if not getattr(self, '_drag_hwnd', 0):
+            return
+        # 用 ctypes GetCursorPos 取真实全屏坐标(跨窗口不丢)
+        class Pt(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+        pt = Pt()
+        user32.GetCursorPos(ctypes.byref(pt))
+        ox, oy = self._drag_offset
+        try:
+            # SWP_NOSIZE|SWP_NOZORDER = 0x0005
+            user32.SetWindowPos(self._drag_hwnd, 0, pt.x - ox, pt.y - oy, 0, 0, 0x0005)
+        except Exception:
+            pass
+
+    def _drag_return(self):
+        # 用户拖回坞内: 停掉跟手, 让窗口回原位
+        if hasattr(self, '_drag_timer') and self._drag_timer:
+            self._drag_timer.stop()
+            self._drag_timer = None
+
+    def _drag_drop(self, hwnd, x, y):
+        # 坞外松手: 停止跟手, 窗口已停在鼠标松开点
+        if hasattr(self, '_drag_timer') and self._drag_timer:
+            self._drag_timer.stop()
+            self._drag_timer = None
+
+    def _drag_end(self, in_dock, x, y):
+        # 坞内松手重排: 状态清理
+        self._drag_hwnd = 0
 
     # ---- 顶栏拖动 ----
     def mousePressEvent(self, e):

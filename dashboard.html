@@ -10,9 +10,10 @@
     --scale: 1;             /* 卡片+字体等比缩放, 可右键设置 */
   }
   * { margin:0; padding:0; box-sizing:border-box; }
-  html, body { background: var(--bg); overflow: hidden;
+  html, body { background: var(--bg); overflow: visible;
                font-family: 'Microsoft YaHei UI','Segoe UI',sans-serif; user-select:none; }
-  #cards { perspective: 900px;
+  #cards { position: relative;     /* 让 .insert-line (absolute) 相对 cards 定位, 不回退到视口 */
+           perspective: 900px;
            padding: calc(4px*var(--scale)) calc(10px*var(--scale)) calc(10px*var(--scale));
            display:flex; flex-direction:column; gap: calc(10px*var(--scale)); }
 
@@ -21,7 +22,7 @@
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.06);
     transform-style: preserve-3d;
-    transition: transform .28s cubic-bezier(.2,.8,.25,1), box-shadow .25s, background .2s;
+    transition: transform .22s cubic-bezier(.2,.8,.25,1), box-shadow .25s, background .2s;
     will-change: transform; cursor: pointer;
   }
   .card::before {                       /* 光斑: 跟随光标 */
@@ -77,11 +78,37 @@
   #ver { position:absolute; right:7px; bottom:3px; font-size:9px;
          color: var(--fg); opacity:.28; pointer-events:none; letter-spacing:.3px;
          font-family: 'Segoe UI', sans-serif; }
+
+  /* 拖拽层: fixed 覆盖整个视口, 承载被拖出的卡片(完全突破 overflow 裁剪) */
+  #drag-layer { position:fixed; left:0; top:0; width:100vw; height:100vh;
+                overflow:visible; pointer-events:none; z-index:9998; }
+
+  /* 拖拽: 坞内显示 Apple 风格占位槽 + 卡片提升到 body 层自由跟随鼠标 */
+  .card.ph {
+    background: rgba(var(--accent),0.10);
+    border: 1.5px dashed rgba(var(--accent),0.56);
+    box-shadow: 0 0 0 1px rgba(var(--accent),0.18) inset, 0 10px 28px rgba(0,0,0,.18);
+    pointer-events:none;
+    opacity:.88;
+  }
+  .card.flip-anim { transition: transform .22s cubic-bezier(.2,.8,.25,1); }
+  /* ghost 必须 pointer-events:auto, 否则 setPointerCapture 在 Qt WebEngine 下会丢事件 */
+  .card.ghost { position:fixed; z-index:9999; pointer-events:auto;
+                box-shadow: 0 22px 50px rgba(0,0,0,.6), 0 0 0 1px rgba(var(--accent),0.55) inset;
+                transition: opacity .15s, transform .15s; }
+  /* 拖拽期间: 让 drag-layer 接管所有指针事件, 防止穿透到 #cards (不会锁死全屏坞).
+     class 加在 <body> 上, settle 收场时立刻移除, 不留残留. */
+  body.dragging-now #drag-layer { pointer-events: auto; }
+  .card.ghost::before { opacity:1; }
+  .insert-line { display:none !important; position:absolute; height:3px; border-radius:2px;
+                 background: rgb(var(--accent)); box-shadow: 0 0 12px rgba(var(--accent),0.85);
+                 pointer-events:none; z-index:60; transition: top .08s; }
 </style>
 </head>
 <body>
+  <div id="drag-layer"></div>
   <div id="cards"></div>
-  <div id="ver">V2.7</div>
+  <div id="ver">V2.9</div>
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <script>
     let bridge = null;
@@ -133,6 +160,7 @@
     });
 
     const cards = document.getElementById('cards');
+  const dragLayer = document.getElementById('drag-layer');
     const nodes = new Map();
     const pctColor = p => p >= 90 ? '#ff453a' : p >= 70 ? '#f5a623' : '#3ddc84';
     const fmt = n => !n ? '' : n >= 1e6 ? (n/1e6).toFixed(2)+'M'
@@ -141,7 +169,7 @@
     // ---- 滚轮切换窗口: 上至1 / 下至尾, 仅悬停在卡片上生效, 轻高亮 + 落定显示该窗口 ----
     let selIdx = null, focusTimer = null;
     function selectIdx(idx) {
-      const list = [...cards.children];
+      const list = 获取活卡列表();
       if (!list.length) return;
       idx = Math.max(0, Math.min(list.length - 1, idx));
       selIdx = idx;
@@ -154,15 +182,623 @@
       const card = e.target.closest('.card');
       if (!card) return;                       // 只有滚轮落在卡片上才生效
       e.preventDefault();
-      const list = [...cards.children];
+      const list = 获取活卡列表();
       if (selIdx === null) selIdx = list.indexOf(card);   // 从当前悬停卡起步
       selectIdx(selIdx + (e.deltaY < 0 ? -1 : 1));        // 上->往1, 下->往尾
     }, { passive: false });
     cards.addEventListener('mouseleave', () => {          // 离开坞: 复位选择与高亮
       selIdx = null;
       clearTimeout(focusTimer);
-      [...cards.children].forEach(c => c.classList.remove('sel'));
+      获取活卡列表().forEach(c => c.classList.remove('sel'));
     });
+
+/* ==========================================================================
+ * 拖拽核心 (V2.9 Apple 半卡越线版) - 中心线越过相邻半张即换位
+ *
+ * 设计原则:
+ *   - 落点只认整数 targetSlot (0..N), 但换位触发只看拖拽卡中心线是否越过相邻卡中心线
+ *   - 坞内显示可见占位槽, 目标槽变化时用 FLIP 让普通卡片平滑让位
+ *   - 不用 #cards.dragging-now 类 (改用 body.dragging-now → 控 drag-layer pointer-events)
+ *   - 坞外松手 → 卡片自动飞回占位原位, 不通知 Python
+ *   - 去除 bridge.dragStart/Outside/Return/Drop/End 调用
+ *
+ * 状态机:
+ *   pointerdown  → 仅记录 + setPointerCapture + 5s 兜底
+ *   pointermove  → 阈值前静默; 越过阈值 → 启动拖拽 (一次性) + rAF 节流
+ *   pointerup    → 坞内: 确认当前占位槽 | 坞外: 180ms transition 飞回 | 纯点击: jump
+ *   pointercancel→ 同 坞外
+ * ========================================================================== */
+
+// 当前拖拽的控制块; null 表示无拖拽
+// 字段: { el, hwnd, startX, startY, offX, offY, baseRect, moved,
+//         dragIndex, targetSlot, prevTargetSlot, insertBefore, dockRect }
+let 拖拽控制块 = null;
+
+// settle 动画进行中 (180ms 坞外 transition 期间阻止误触发 click)
+let 落点动画中 = false;
+
+// rAF 节流: 100Hz pointermove 合并为每帧 1 次
+let 最近移动事件 = null;
+let 是否已调度rAF = false;
+
+// 5s 卡死兜底 timer
+let 卡死兜底定时器 = null;
+
+// window.pointerup 兜底监听器是否已挂载 (一次性)
+let 窗口兜底已挂载 = false;
+
+// 蓝色插入线 DOM 引用 (创建一次, 反复 show/hide)
+let 插入线元素 = null;
+
+// 占位卡片 (被拖卡片的可见等高替身, 启动拖拽时创建, 收场恢复时 remove)
+let 占位卡片 = null;
+
+// FLIP 让位动画批次号: 防止快速切槽时旧 timeout 清掉新动画
+let 让位动画批次 = 0;
+
+// 坞外回坞动画 timer: 新拖拽启动时必须取消旧 setTimeout, 防止删掉新占位
+let 回坞定时器 = null;
+let 回坞批次 = 0;
+
+    /* ====================================================================
+     * 第一组: 工具函数 - 半卡越线 / 可见占位 / FLIP 让位 / 跟手辅助
+     * ==================================================================== */
+
+    /**
+     * 工具1: 缓存坞矩形 (启动拖拽时一次性调用, 拖动期间复用避免 reflow)
+     */
+    function 缓存坞矩形() {
+      拖拽控制块.dockRect = cards.getBoundingClientRect();
+    }
+
+    /**
+     * 工具2: 点是否在坞内 (含 8px 容差)
+     * 用缓存的 dockRect 判断, 不读 DOM
+     */
+    function 点在坞内(x, y) {
+      if (!拖拽控制块 || !拖拽控制块.dockRect) return false;
+      const r = 拖拽控制块.dockRect;
+      const cardH = (拖拽控制块.baseRect && 拖拽控制块.baseRect.height) || 60;
+      // 顶/底扩出两张卡高度: 允许拖到最上面以上或最下面以下来触发首尾换位
+      return x >= r.left - 40 && x <= r.right + 40 &&
+             y >= r.top - cardH * 2 && y <= r.bottom + cardH * 2;
+    }
+
+
+
+    /**
+     * 工具4: 创建占位卡片 (阶段 B 调用)
+     * 在 cards 容器内插入一个可见等高槽位, 占住被拖卡片的目标位置
+     */
+    function 创建占位卡片(el) {
+      占位卡片 = document.createElement('div');
+      占位卡片.className = 'card ph';
+      const h = (拖拽控制块 && 拖拽控制块.baseRect) ? 拖拽控制块.baseRect.height : el.offsetHeight;
+      占位卡片.style.height = h + 'px'; // 与原卡等高, 但保持可见
+      el.parentNode.insertBefore(占位卡片, el);         // 此时 el 还在 cards 容器
+    }
+
+    /**
+     * 工具5: 获取活卡列表 (排除占位/ghost/插入线)
+     * 返回值顺序就是当前 DOM 顺序, 用它判断占位槽与相邻卡片关系.
+     */
+    function 获取活卡列表() {
+      return [...cards.children].filter(c =>
+        c.classList && c.classList.contains('card') &&
+        c !== 占位卡片 &&
+        !c.classList.contains('ph') &&
+        !c.classList.contains('ghost'));
+    }
+
+    /**
+     * 工具7: 清理普通卡片让位动画残留
+     */
+    function 清理让位动画残留() {
+      for (const c of [...cards.querySelectorAll('.card')]) {
+        if (c.classList.contains('ghost') || c.classList.contains('ph')) continue;
+        c.classList.remove('flip-anim');
+        c.style.transition = '';
+        if (c.style.transform && c.style.transform.startsWith('translateY(')) c.style.transform = '';
+      }
+    }
+
+    /**
+     * 工具8: FLIP 让位动画
+     * 只在占位槽实际换位时调用, 让被占位挤动的卡片平滑滑到新位置.
+     */
+    function 触发让位动画(firstRects) {
+      const 批次 = ++让位动画批次;
+      const moved = [];
+      const 活卡片 = 获取活卡列表();
+      for (const c of 活卡片) {
+        const first = firstRects.get(c);
+        if (!first) continue;
+        const last = c.getBoundingClientRect();
+        const dy = first.top - last.top;
+        if (Math.abs(dy) < 0.5) continue;
+        c.classList.remove('flip-anim');
+        c.style.transition = 'none';
+        c.style.transform = `translateY(${dy}px)`;
+        moved.push(c);
+      }
+      if (!moved.length) return;
+      void cards.offsetHeight;
+      requestAnimationFrame(() => {
+        for (const c of moved) {
+          c.classList.add('flip-anim');
+          c.style.transition = '';
+          c.style.transform = '';
+        }
+        setTimeout(() => {
+          if (批次 !== 让位动画批次) return;
+          for (const c of moved) {
+            c.classList.remove('flip-anim');
+            c.style.transition = '';
+            c.style.transform = '';
+          }
+        }, 260);
+      });
+    }
+
+    /**
+     * 工具10: 计算插入参考点 (半卡越线换位)
+     * 只看被拖卡片中心线: 越过上一张/下一张卡片中心线时, 占位槽逐位换位.
+     * @param {number} dragCenterY 被拖卡片中心线的 clientY
+     */
+    function 计算插入参考点(dragCenterY) {
+      if (!拖拽控制块 || !占位卡片 || 占位卡片.parentNode !== cards) return;
+      let 排序卡片 = [...cards.children].filter(c =>
+        c.classList && c.classList.contains('card') && !c.classList.contains('ghost'));
+      let phIndex = 排序卡片.indexOf(占位卡片);
+      if (phIndex < 0) return;
+
+      let moved = false;
+      let firstRects = null;
+      const 记录移动前位置 = () => {
+        if (firstRects) return;
+        让位动画批次++;
+        清理让位动画残留();
+        firstRects = new Map();
+        for (const c of 获取活卡列表()) firstRects.set(c, c.getBoundingClientRect());
+      };
+
+      // 往上: 被拖卡片中心线越过上一张卡片中心线, 占位槽上移一位.
+      // 用 while 是为了快速拖动时一帧跨多张也能补齐所有换位.
+      while (phIndex > 0) {
+        const prev = 排序卡片[phIndex - 1];
+        const r = prev.getBoundingClientRect();
+        const prevMid = r.top + r.height / 2;
+        if (dragCenterY >= prevMid) break;
+        记录移动前位置();
+        cards.insertBefore(占位卡片, prev);
+        moved = true;
+        排序卡片 = [...cards.children].filter(c =>
+          c.classList && c.classList.contains('card') && !c.classList.contains('ghost'));
+        phIndex = 排序卡片.indexOf(占位卡片);
+      }
+
+      // 往下: 被拖卡片中心线越过下一张卡片中心线, 占位槽下移一位.
+      while (phIndex >= 0 && phIndex < 排序卡片.length - 1) {
+        const next = 排序卡片[phIndex + 1];
+        const r = next.getBoundingClientRect();
+        const nextMid = r.top + r.height / 2;
+        if (dragCenterY <= nextMid) break;
+        记录移动前位置();
+        cards.insertBefore(占位卡片, next.nextSibling);
+        moved = true;
+        排序卡片 = [...cards.children].filter(c =>
+          c.classList && c.classList.contains('card') && !c.classList.contains('ghost'));
+        phIndex = 排序卡片.indexOf(占位卡片);
+      }
+
+      const slot = Math.max(0, phIndex);
+      const 参考点 = 排序卡片[slot + 1] || null;
+      拖拽控制块.prevTargetSlot = 拖拽控制块.targetSlot;
+      拖拽控制块.targetSlot = slot;
+      拖拽控制块.insertBefore = 参考点;
+
+      if (moved && firstRects) {
+        触发让位动画(firstRects);
+      }
+      显示插入线(dragCenterY);
+    }
+
+
+    /**
+     * 工具9: 跟手移动 (每帧被 处理每帧移动 调用)
+     * 设 el 的 left/top/opacity/transform 跟随鼠标
+     * 视觉差异: 坞内 (0.92 + scale 1.02) vs 坞外 (1.0 + scale 1.0)
+     */
+    function 跟手移动(cx, cy) {
+      if (!拖拽控制块) return;
+      const el = 拖拽控制块.el;
+      el.style.left = (cx - 拖拽控制块.offX) + 'px';
+      el.style.top  = (cy - 拖拽控制块.offY) + 'px';
+      const 在坞内 = 点在坞内(cx, cy);
+      if (在坞内) {
+        el.style.opacity = '0.92';
+        el.style.transform = 'scale(1.02)';
+      } else {
+        // 坞外: 保持原大小 (老公确认不需要 scale 0.95 rotateZ 效果)
+        el.style.opacity = '0.85';
+        el.style.transform = 'scale(1)';
+      }
+    }
+
+    /**
+     * 工具10a: 初始化插入线 (startDrag 时一次性创建)
+     */
+    function 初始化插入线() {
+      if (插入线元素) return;
+      插入线元素 = document.createElement('div');
+      插入线元素.id = 'il';
+      插入线元素.className = 'insert-line';
+      cards.appendChild(插入线元素);
+    }
+
+    /**
+     * 工具11b: 判断线已隐藏
+     * 半卡越线只看拖拽卡中心线与相邻卡中心线, 不再依赖蓝线视觉反馈.
+     */
+    function 显示插入线() {
+      隐藏插入线();
+    }
+
+    /**
+     * 工具10c: 隐藏插入线
+     */
+    function 隐藏插入线() {
+      if (插入线元素) 插入线元素.style.display = 'none';
+    }
+
+    /* ====================================================================
+     * 第二组: 核心函数 (12 个) - 拖拽生命周期
+     * ==================================================================== */
+
+    /**
+     * 强制清理拖拽残留 (新拖拽启动前调用)
+     *
+     * 解决快速连续拖拽卡死的根因:
+     *   第一次拖出坞外松手 → 坞外自动回坞 启动 setTimeout(180ms)
+     *   180ms 内第二次 pointerdown → 占位卡片 全局变量被新的覆盖,
+     *     但第一次的占位卡片/ghost 卡片/拖拽控制块 都还残留.
+     *   180ms 后第一次 setTimeout 触发 → 把第一次的 el 插到第二次的占位位置 → layout 错乱 + 多个 ghost 叠加 → 全屏坞卡死.
+     *
+     * 修法: 在 新拖拽启动前 (启动拖拽 入口) 强制清掉所有残留:
+     *   - dragLayer 里所有 .card.ghost (立即收场)
+     *   - cards 里的占位卡片
+     *   - 拖拽控制块、stuckTimer、rAF 调度、body.dragging-now
+     *   - 插入线
+     * 强制 = 同步执行, 不等 setTimeout
+     *
+     * 关键 (V2.9 修复): 不清 拖拽控制块 和 卡死兜底定时器!
+     *   启动拖拽() 在调用本函数之后还要用 拖拽控制块.baseRect 和 拖拽控制块.dockRect.
+     *   如果本函数把 拖拽控制块 设 null, 启动拖拽 立即抛 TypeError → 拖拽完全失效.
+     *   卡死兜底定时器 也不清: 那是本次新拖拽的有效 5s 兜底, 清掉就失去保护.
+     *   本函数只清 "残留" 的 DOM/状态 (dragLayer ghost, cards 占位, body 类, 插入线, 动画标志).
+     */
+    function 强制清理拖拽残留() {
+      // 1. dragLayer 里所有 ghost 卡片 (上一次拖拽未收场的) 强制收场 + 移回 cards 末尾 (不能丢失)
+      for (const g of [...dragLayer.querySelectorAll('.card.ghost')]) {
+        g.classList.remove('ghost');
+        g.style.cssText = '';
+        if (g.dataset.hwnd && cards && !cards.contains(g)) {
+          cards.appendChild(g);   // 移回 cards 末尾 (防御丢失)
+        }
+      }
+      // 2. cards 里的占位卡片 (无论新旧) — 注意: 如果当前正在拖的占位也在 cards 里, 也会被删 (正常, 因为会立即被 创建占位卡片 重建)
+      for (const ph of [...cards.querySelectorAll('.card.ph')]) {
+        ph.remove();
+      }
+      占位卡片 = null;
+      // 3. ★ 不清 拖拽控制块 (那是新的, 启动拖拽() 后面还要用)
+      // 4. ★ 不清 卡死兜底定时器 (那是新的, 5s 兜底不能丢)
+      // 5. rAF 调度 (新拖拽要重新调度)
+      是否已调度rAF = false;
+      最近移动事件 = null;
+      // 6. body 状态 (如果上次遗留, 清掉)
+      document.body.classList.remove('dragging-now');
+      // 7. 落点动画标志 + 旧回坞 timer
+      落点动画中 = false;
+      回坞批次++;
+      if (回坞定时器) { clearTimeout(回坞定时器); 回坞定时器 = null; }
+      // 8. 插入线 + 让位动画残留
+      隐藏插入线();
+      让位动画批次++;
+      清理让位动画残留();
+    }
+
+    /**
+     * 核心1: 启动拖拽 (位移 > 6px 时由 处理移动 调用一次)
+     * 1) 先调用 强制清理拖拽残留 (防止快速拖拽状态叠加卡死)
+     * 2) 断开 marquee 的 ResizeObserver
+     * 3) 缓存坞矩形 (dockRect)
+     * 4) 在 cards 里创建可见等高占位槽
+     * 5) 钉死 el 的 left/top/width/height (防止 ghost 切换时跳)
+     * 6) 加 .ghost class
+     * 7) body.dragging-now → drag-layer 接管 pointer-events
+     * 8) dragLayer.appendChild(el) 提到 fixed 全屏层
+     * 9) 初始化插入线
+     * @param {HTMLElement} el
+     */
+    function 启动拖拽(el) {
+      // ★ 关键: 强制清理上一次拖拽的残留 (解决快速拖拽卡死)
+      强制清理拖拽残留();
+
+      const t = el.querySelector('.title');
+      ro.unobserve(t); ro.unobserve(t && t.querySelector('.txt'));
+      const 初始卡片 = 获取活卡列表();
+      const dragIndex = Math.max(0, 初始卡片.indexOf(el));
+      拖拽控制块.dragIndex = dragIndex;
+      拖拽控制块.targetSlot = dragIndex;
+      拖拽控制块.prevTargetSlot = dragIndex;
+      缓存坞矩形();
+      创建占位卡片(el);
+      // 钉死位置 (在加 ghost/fixed 之前, 避免跳变)
+      const r = 拖拽控制块.baseRect;
+      el.style.width  = r.width  + 'px';
+      el.style.height = r.height + 'px';
+      el.style.left   = r.left   + 'px';
+      el.style.top    = r.top    + 'px';
+      el.style.opacity = '0.92';
+      el.style.transform = 'scale(1.02)';
+      el.classList.add('ghost');
+      dragLayer.appendChild(el);                              // 提到 drag-layer (fixed 全屏层)
+      document.body.classList.add('dragging-now');            // 让 drag-layer 接管 pointer-events
+      初始化插入线();
+    }
+
+    /**
+     * 核心2: 坞内落点 (D1 - 松手在坞内, 确认当前占位槽)
+     * 1) 优先把 ghost 插回当前可见占位槽之前
+     * 2) 删除占位 → 预览状态成为真实顺序
+     * 3) 立刻 收场恢复 (无 setTimeout)
+     * @param {HTMLElement} el
+     */
+    function 坞内落点(el) {
+      if (!拖拽控制块 && !el.classList.contains('ghost')) return;
+      if (占位卡片 && 占位卡片.parentNode === cards) {
+        占位卡片.parentNode.insertBefore(el, 占位卡片);
+      } else {
+        const 参考点 = (拖拽控制块 && 拖拽控制块.insertBefore) || null;
+        const 有效参考点 = (参考点 && 参考点.parentNode === cards) ? 参考点 : null;
+        if (有效参考点) cards.insertBefore(el, 有效参考点);
+        else cards.appendChild(el);
+      }
+      if (占位卡片 && 占位卡片.parentNode === cards) 占位卡片.remove();
+      收场恢复(el);
+    }
+
+    /**
+     * 核心3: 坞外自动回坞 (D2 简化版 - 老公决策)
+     * 拖出坞外松手 → 卡片自动飞回占位原位, 不通知 Python.
+     * 用一次性 180ms transition 飞回 (不在 rAF 循环里, 不累积).
+     * @param {HTMLElement} el
+     */
+    function 坞外自动回坞(el) {
+      // 取占位的视口坐标, 一次性 transition 飞回去
+      const rect = (占位卡片 && 占位卡片.parentNode === cards)
+        ? 占位卡片.getBoundingClientRect()
+        : null;
+      if (rect) {
+        el.style.transition = 'left .18s ease-out, top .18s ease-out, opacity .18s ease-out, transform .18s ease-out';
+        el.style.left = rect.left + 'px';
+        el.style.top  = rect.top  + 'px';
+        el.style.opacity = '1';
+        el.style.transform = '';
+      } else {
+        el.style.transition = '';
+      }
+      // 180ms 后: el 插回占位槽, 预览顺序成为真实顺序, 收场恢复
+      const 本次回坞批次 = ++回坞批次;
+      if (回坞定时器) clearTimeout(回坞定时器);
+      回坞定时器 = setTimeout(() => {
+        if (本次回坞批次 !== 回坞批次) return;
+        回坞定时器 = null;
+        if (占位卡片 && 占位卡片.parentNode === cards) {
+          占位卡片.parentNode.insertBefore(el, 占位卡片);
+          占位卡片.remove();
+        } else {
+          cards.appendChild(el);
+        }
+        收场恢复(el);
+      }, 180);
+    }
+
+    /**
+     * 核心4: 取消自动回坞 (pointercancel)
+     * 语义别名 — 复用 坞外自动回坞 (V2.8.1 简化, pointercancel 不区分坞内坞外, 统一回到占位槽)
+     * @param {HTMLElement} el
+     */
+    function 取消自动回坞(el) {
+      坞外自动回坞(el);
+    }
+
+    /**
+     * 核心5: 收场恢复 (settle 公共清理 — 坞内立即调, 坞外 180ms 后调)
+     * 职责:
+     *   - 移除 .ghost class
+     *   - 清空所有 inline 样式 (transition/left/top/width/height/opacity/transform)
+     *   - 移除 body.dragging-now (恢复 drag-layer 默认 pointer-events:none)
+     *   - renumber 重编 badge 序号
+     *   - 重连 ResizeObserver
+     *   - 设 _suppress=true 抑制 settle 引发的 click
+     * @param {HTMLElement} el
+     */
+    function 收场恢复(el) {
+      让位动画批次++;
+      清理让位动画残留();
+      el.classList.remove('ghost');
+      el.style.cssText = '';
+      document.body.classList.remove('dragging-now');
+      renumber();
+      const t = el.querySelector('.title');
+      if (t) { ro.observe(t); const txt = t.querySelector('.txt'); if (txt) ro.observe(txt); }
+      落点动画中 = false;
+      el._suppress = true;
+    }
+
+    /**
+     * 核心6: 卡死兜底 (5s setTimeout)
+     * 万一 pointerup 真的丢了, 强制清理:
+     *   - 若处于拖动中 (moved): 走 坞内落点 → 让卡片瞬间归位 (保护默认槽位)
+     *   - 若只是按下但未拖: 直接释放 (避免误触发 0.18s 飞回)
+     * 关键: 必然走 收场恢复 → body.dragging-now 被清掉, 不会永久全黑
+     * @param {HTMLElement} el
+     */
+    function 卡死兜底(el) {
+      if (拖拽控制块 && 拖拽控制块.el === el) {
+        const wEl = 拖拽控制块.el;
+        const wasMoved = 拖拽控制块.moved;
+        拖拽控制块 = null;
+        if (wasMoved && wEl.classList.contains('ghost')) {
+          console.warn('[claude-dock] 拖拽卡死 (>5s 无 pointerup), 强制归位');
+          落点动画中 = true;
+          坞内落点(wEl);    // 走 坞内落点 → 收场恢复 清理全部状态
+        }
+      }
+      卡死兜底定时器 = null;
+    }
+
+    /**
+     * 核心7: 处理按下 (阶段 A 捕获, 只一次, 不动 DOM)
+     * 职责:
+     *   - 写拖拽控制块 (含 offX/offY 用于跟手不跳)
+     *   - setPointerCapture (防事件丢失)
+     *   - 启 5s 兜底定时器
+     * @param {HTMLElement} el
+     * @param {PointerEvent} e
+     */
+    function 处理按下(el, e) {
+      if (e.button !== 0) return;                       // 只响应左键
+      if (e.target.closest('button,input')) return;    // 跳过 button/input
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      拖拽控制块 = { el, startX: e.clientX, startY: e.clientY, moved: false,
+                    offX: e.clientX - rect.left, offY: e.clientY - rect.top,
+                    hwnd: el.dataset.hwnd, baseRect: rect };
+      el.setPointerCapture(e.pointerId);
+      // 5s 卡死兜底
+      if (卡死兜底定时器) clearTimeout(卡死兜底定时器);
+      卡死兜底定时器 = setTimeout(() => 卡死兜底(el), 5000);
+    }
+
+    /**
+     * 核心8: 处理移动 (阶段 C 入口, 100Hz)
+     * 职责:
+     *   - 6px 阈值, 调 启动拖拽
+     *   - 存最近移动事件 + 调度 rAF
+     * @param {HTMLElement} el
+     * @param {PointerEvent} e
+     */
+    function 处理移动(el, e) {
+      if (!拖拽控制块 || 拖拽控制块.el !== el) return;
+      const dx = e.clientX - 拖拽控制块.startX, dy = e.clientY - 拖拽控制块.startY;
+      if (!拖拽控制块.moved) {
+        if (dx*dx + dy*dy < 36) return;     // 6px 平方阈值
+        拖拽控制块.moved = true;
+        启动拖拽(el);
+      }
+      最近移动事件 = e;
+      if (!是否已调度rAF) {
+        是否已调度rAF = true;
+        requestAnimationFrame(处理每帧移动);
+      }
+    }
+
+    /**
+     * 核心9: 处理每帧移动 (rAF 回调, 每帧最多一次, 60Hz)
+     * 流程: 跟手 → (坞内时) 用拖拽卡中心线做半卡越线换位 → 可见占位 + FLIP 让位
+     * 坞外时只跟手, 隐藏插入线
+     */
+    function 处理每帧移动() {
+      是否已调度rAF = false;
+      const e = 最近移动事件;
+      if (!e || !拖拽控制块) { 最近移动事件 = null; return; }
+      最近移动事件 = null;
+      跟手移动(e.clientX, e.clientY);
+      if (!点在坞内(e.clientX, e.clientY)) {
+        隐藏插入线();
+        return;
+      }
+      const dragCenterY = e.clientY - 拖拽控制块.offY + 拖拽控制块.baseRect.height / 2;
+      计算插入参考点(dragCenterY);
+    }
+
+    /**
+     * 核心10: 处理抬起 (阶段 D 落点分发)
+     * 三种情况:
+     *   - 纯点击 (未移动) → bridge.jump 跳转
+     *   - 坞内松手 → 坞内落点
+     *   - 坞外松手 → 坞外自动回坞 (不通知 Python)
+     * @param {HTMLElement} el
+     * @param {PointerEvent} e
+     */
+    function 处理抬起(el, e) {
+      if (!拖拽控制块 || 拖拽控制块.el !== el) return;
+      // 兜底: rAF 调度了但没跑 (快速松手), 同步跑一次
+      if (拖拽控制块.moved && 是否已调度rAF) {
+        是否已调度rAF = false;
+        处理每帧移动();
+      }
+      const wasMoved = 拖拽控制块.moved;
+      const hwnd = 拖拽控制块.hwnd, cx = e.clientX, cy = e.clientY;
+      try { el.releasePointerCapture(e.pointerId); } catch(_) {}
+      if (卡死兜底定时器) { clearTimeout(卡死兜底定时器); 卡死兜底定时器 = null; }
+      if (是否已调度rAF) { 是否已调度rAF = false; 最近移动事件 = null; }
+      const dropIn = 点在坞内(cx, cy);
+      const wEl = 拖拽控制块.el;
+      拖拽控制块 = null;
+      隐藏插入线();
+      if (!wasMoved) {                                   // 纯点击
+        if (bridge) bridge.jump('' + hwnd);
+        return;
+      }
+      落点动画中 = true;
+      if (dropIn) 坞内落点(wEl);                         // 坞内: 确认当前可见占位槽
+      else        坞外自动回坞(wEl);                     // 坞外: 0.18s 飞回占位槽
+    }
+
+    /**
+     * 核心11: 处理取消 (pointercancel, 系统中断 e.g. alt-tab / 触屏被抢)
+     * 行为: 跟 坞外自动回坞 一致 (0.18s 飞回占位槽)
+     * @param {HTMLElement} el
+     * @param {PointerEvent} e
+     */
+    function 处理取消(el, e) {
+      if (!拖拽控制块 || 拖拽控制块.el !== el) return;
+      const wasMoved = 拖拽控制块.moved;
+      const wEl = 拖拽控制块.el;
+      try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (卡死兜底定时器) { clearTimeout(卡死兜底定时器); 卡死兜底定时器 = null; }
+      if (是否已调度rAF) { 是否已调度rAF = false; 最近移动事件 = null; }
+      拖拽控制块 = null;
+      隐藏插入线();
+      if (!wasMoved) return;                             // 只是按下, 不应触发回坞
+      落点动画中 = true;
+      取消自动回坞(wEl);
+    }
+
+    /**
+     * 核心12: 绑定卡片拖拽 (给一张卡片绑 4 个事件 + 一次性 window 兜底)
+     * @param {HTMLElement} el
+     */
+    function 绑定卡片拖拽(el) {
+      el.addEventListener('pointerdown', e => 处理按下(el, e));
+      el.addEventListener('pointermove', e => 处理移动(el, e));
+      el.addEventListener('pointerup',   e => 处理抬起(el, e));
+      el.addEventListener('pointercancel', e => 处理取消(el, e));
+      // window 兜底只挂一次
+      if (!窗口兜底已挂载) {
+        窗口兜底已挂载 = true;
+        window.addEventListener('pointerup', e => {
+          if (!拖拽控制块) return;
+          const dEl = 拖拽控制块.el;
+          if (!dEl) return;
+          if (拖拽控制块 && 拖拽控制块.el === dEl) 处理抬起(dEl, e);
+        });
+      }
+    }
 
     function makeCard() {
       const el = document.createElement('div');
@@ -174,6 +810,7 @@
             <span class="metric"><span class="tok"></span><span class="pct"></span></span></div>
         </div>`;
       el.addEventListener('mousemove', e => {          // 3D 倾斜 + 光斑跟随
+        if (拖拽控制块) return;                         // 任意拖拽期间全坞禁用 3D 倾斜 (防冲突)
         const r = el.getBoundingClientRect();
         const px = (e.clientX - r.left) / r.width;
         const py = (e.clientY - r.top) / r.height;
@@ -182,8 +819,14 @@
         el.style.setProperty('--mx', px * 100 + '%');
         el.style.setProperty('--my', py * 100 + '%');
       });
-      el.addEventListener('mouseleave', () => { el.style.transform = ''; });
-      el.addEventListener('click', () => { if (bridge) bridge.jump('' + el.dataset.hwnd); });
+      el.addEventListener('mouseleave', () => { if (!拖拽控制块) el.style.transform = ''; });
+      el.addEventListener('click', () => {
+        if (el._suppress) { el._suppress = false; return; }    // settle 结束引发的 click → 跳过
+        if (落点动画中) return;                                 // settle 动画进行中, 不触发跳转
+        if (拖拽控制块) return;                                  // 跟手期间(异常)
+        if (bridge && el.dataset.hwnd) bridge.jump('' + el.dataset.hwnd);
+      });
+      绑定卡片拖拽(el);                              // 拖拽支持
       const titleEl = el.querySelector('.title');
       ro.observe(titleEl);
       ro.observe(titleEl.querySelector('.txt'));
@@ -207,7 +850,12 @@
       });
       renumber();                              // 重编 badge
     };
-    function renumber() { [...cards.children].forEach((c, i) => { c.querySelector('.badge').textContent = i + 1; }); }
+    function renumber() {
+      获取活卡列表().forEach((c, i) => {
+        const badge = c.querySelector('.badge');
+        if (badge) badge.textContent = i + 1;
+      });
+    }
     function updateData(el, s) {
       el.dataset.hwnd = s.hwnd;
       const txt = el.querySelector('.title .txt');
