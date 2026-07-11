@@ -3,9 +3,19 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py.bak
 
-# Runtime config (window position / pin state / theme — auto-saved by the GUI)
+# Runtime config (window position / pin state / theme - auto-saved by the GUI)
 dock_web_config.json
+
+# PyInstaller build artifacts (built fresh on demand via build.bat)
+build/
+dist/
+
+# Release artifacts (zip is uploaded to GitHub Releases, not git)
+release/ClaudeDock/
+release/*.zip
+release/SHA256SUMS.txt
 
 # Full-resolution screenshot backup (README uses screenshot.jpg)
 screenshot.png
@@ -15,3 +25,5 @@ screenshot.png
 .idea/
 .DS_Store
 Thumbs.db
+*.bak
+*~

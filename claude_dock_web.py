@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Claude Code 悬浮收纳坞 · Web 3D 版 (web坞V2.8)
+Claude Code 悬浮收纳坞 · Web 3D 版 (web坞V2.9)
 =============================================
+相对 V2.8:
+  - scanner 内联：纯函数搬到 scanner_core.py，主坞直接 import 调用（不再走 subprocess）
+  - 双路径资源定位：frozen 时 HERE=EXE 同级、ASSETS=_MEIPASS
+  - 关闭语义改造：closeEvent 隐藏到托盘（托盘由 tray_main.py 接管）
+
 相对 V2.7:
   - 卡片坞内拖拽重排: 长按拖动, 抬起幽灵卡片 + 蓝色插入线, 松手即时换位
   - 卡片拖出坞: 卡片"消失", Python 16ms 心跳把对应 Claude 窗口实时跟手; 松手停在落点
     拖回坞内则停止跟手, 卡片"复活"留在原位
 继承: 顺序固定 / 高DPI / DWM圆角 / 滚轮切换 / 标题跑马灯 / 右键设置 / 字体 / 右键标题开文件夹
+
+V2.9 入口改用 tray_main.py（带 Windows 系统托盘），本文件保留作为 Dock 类实现。
 """
 import sys
 import os
@@ -19,8 +26,13 @@ user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 dwmapi = ctypes.WinDLL('dwmapi')
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCANNER = os.path.join(os.path.dirname(HERE), 'python坞V1.08', 'claude_dock.py')
+# frozen (PyInstaller) 时: HERE = EXE 同级(可写配置); ASSETS = _MEIPASS(只读资源)
+# 未打包时: 都指向当前文件目录(便于本地调试)
+if getattr(sys, 'frozen', False):
+    HERE = os.path.dirname(sys.executable)
+    ASSETS = sys._MEIPASS
+else:
+    HERE = ASSETS = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, 'dock_web_config.json')
 DEFAULT_CFG = {'bg': '#1b1b20', 'fg': '#f2f2f7', 'scale': 1.0, 'font': ''}
 CREATE_NO_WINDOW = 0x08000000
@@ -101,11 +113,10 @@ class ScanWorker(QThread):
     done = Signal(list)
 
     def run(self):
+        # 直接调用 scanner_core（已与 EXE 同打包），不再走 subprocess
         try:
-            out = subprocess.run([sys.executable, SCANNER, '--scan'],
-                                 capture_output=True, timeout=12,
-                                 creationflags=CREATE_NO_WINDOW)
-            data = json.loads(out.stdout.decode('utf-8', 'replace') or '[]')
+            import scanner_core as _sc
+            data = _sc.scan_sessions()
         except Exception:
             data = []
         self.done.emit(data)
@@ -198,7 +209,7 @@ class Dock(QWidget):
         self.channel.registerObject('bridge', self.bridge)
         self._font = self.cfg.get('font', '')
         self.view.page().setWebChannel(self.channel)
-        self.view.load(QUrl.fromLocalFile(os.path.join(HERE, 'dashboard.html')))
+        self.view.load(QUrl.fromLocalFile(os.path.join(ASSETS, 'dashboard.html')))
         self.view.loadFinished.connect(self._on_loaded)
         pl.addWidget(self.view, 1)
 
@@ -452,6 +463,15 @@ class Dock(QWidget):
         self.resize(w, h)
         self.update()
         self.panel.update()
+
+    # ---- 托盘接管: 点击 ✕ 不退出, 只隐藏到托盘 ----
+    def closeEvent(self, e):
+        try:
+            self._save_cfg()
+        except Exception:
+            pass
+        e.ignore()
+        self.hide()
 
 
 def main():
