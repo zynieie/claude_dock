@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Claude Code 悬浮收纳坞 · Web 3D 版 (web坞V2.9)
+Claude Code 悬浮收纳坞 · Web 3D 版 (web坞V4.0)
 =============================================
-相对 V2.8:
-  - scanner 内联：纯函数搬到 scanner_core.py，主坞直接 import 调用（不再走 subprocess）
-  - 双路径资源定位：frozen 时 HERE=EXE 同级、ASSETS=_MEIPASS
-  - 关闭语义改造：closeEvent 隐藏到托盘（托盘由 tray_main.py 接管）
-
 相对 V2.7:
   - 卡片坞内拖拽重排: 长按拖动, 抬起幽灵卡片 + 蓝色插入线, 松手即时换位
   - 卡片拖出坞: 卡片"消失", Python 16ms 心跳把对应 Claude 窗口实时跟手; 松手停在落点
     拖回坞内则停止跟手, 卡片"复活"留在原位
 继承: 顺序固定 / 高DPI / DWM圆角 / 滚轮切换 / 标题跑马灯 / 右键设置 / 字体 / 右键标题开文件夹
-
-V2.9 入口改用 tray_main.py（带 Windows 系统托盘），本文件保留作为 Dock 类实现。
 """
 import sys
 import os
@@ -26,14 +19,19 @@ user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 dwmapi = ctypes.WinDLL('dwmapi')
 
-# frozen (PyInstaller) 时: HERE = EXE 同级(可写配置); ASSETS = _MEIPASS(只读资源)
-# 未打包时: 都指向当前文件目录(便于本地调试)
-if getattr(sys, 'frozen', False):
-    HERE = os.path.dirname(sys.executable)
-    ASSETS = sys._MEIPASS
+# 打包模式检测 (PyInstaller --onefile 会设置 sys._MEIPASS)
+_PACKAGED = getattr(sys, '_MEIPASS', None) is not None
+
+if _PACKAGED:
+    HERE = sys._MEIPASS                                    # 打包资源目录 (dashboard.html, scanner)
+    EXE_DIR = os.path.dirname(sys.executable)              # .exe 所在目录
+    CONFIG = os.path.join(os.path.expanduser('~'), '.claude_dock_web.json')
 else:
-    HERE = ASSETS = os.path.dirname(os.path.abspath(__file__))
-CONFIG = os.path.join(HERE, 'dock_web_config.json')
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    EXE_DIR = HERE
+    CONFIG = os.path.join(HERE, 'dock_web_config.json')
+
+SCANNER = os.path.join(os.path.dirname(HERE), 'python坞V1.08', 'claude_dock.py')
 DEFAULT_CFG = {'bg': '#1b1b20', 'fg': '#f2f2f7', 'scale': 1.0, 'font': ''}
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_CONSOLE = 0x00000010
@@ -113,10 +111,16 @@ class ScanWorker(QThread):
     done = Signal(list)
 
     def run(self):
-        # 直接调用 scanner_core（已与 EXE 同打包），不再走 subprocess
         try:
-            import scanner_core as _sc
-            data = _sc.scan_sessions()
+            if _PACKAGED:
+                # 打包模式: 直接 import 扫描器模块 (省掉 subprocess + 捆绑 Python 解释器)
+                from claude_dock_scanner import scan_sessions
+                data = scan_sessions()
+            else:
+                out = subprocess.run([sys.executable, SCANNER, '--scan'],
+                                     capture_output=True, timeout=12,
+                                     creationflags=CREATE_NO_WINDOW)
+                data = json.loads(out.stdout.decode('utf-8', 'replace') or '[]')
         except Exception:
             data = []
         self.done.emit(data)
@@ -209,7 +213,7 @@ class Dock(QWidget):
         self.channel.registerObject('bridge', self.bridge)
         self._font = self.cfg.get('font', '')
         self.view.page().setWebChannel(self.channel)
-        self.view.load(QUrl.fromLocalFile(os.path.join(ASSETS, 'dashboard.html')))
+        self.view.load(QUrl.fromLocalFile(os.path.join(HERE, 'dashboard.html')))
         self.view.loadFinished.connect(self._on_loaded)
         pl.addWidget(self.view, 1)
 
@@ -340,7 +344,7 @@ class Dock(QWidget):
 
     def open_folder(self):
         try:
-            os.startfile(HERE)
+            os.startfile(EXE_DIR)
         except Exception:
             pass
 
@@ -453,25 +457,23 @@ class Dock(QWidget):
         super().showEvent(e)
 
     def moveEvent(self, e):
-        self.update()
-        self.panel.update()
+        # 去掉了 self.update() / self.panel.update(): 拖拽时每秒百次,
+        # 全窗重绘的中间帧会被 QtWebEngine 拿出来说"闪一下".
         super().moveEvent(e)
 
     def _on_screen_changed(self, _scr):
+        # 屏变信号可能连续触发多次, 用 single-shot 去抖,
+        # 让 resize(w+1)/resize(w) 只在最后一次触发时跑, 避免连闪.
+        if not hasattr(self, '_scr_timer') or self._scr_timer is None:
+            self._scr_timer = QTimer(self)
+            self._scr_timer.setSingleShot(True)
+            self._scr_timer.timeout.connect(self._on_screen_changed_apply)
+        self._scr_timer.start(50)
+
+    def _on_screen_changed_apply(self):
         w, h = self.width(), self.height()
         self.resize(w, h + 1)
         self.resize(w, h)
-        self.update()
-        self.panel.update()
-
-    # ---- 托盘接管: 点击 ✕ 不退出, 只隐藏到托盘 ----
-    def closeEvent(self, e):
-        try:
-            self._save_cfg()
-        except Exception:
-            pass
-        e.ignore()
-        self.hide()
 
 
 def main():

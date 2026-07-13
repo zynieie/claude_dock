@@ -108,7 +108,7 @@
 <body>
   <div id="drag-layer"></div>
   <div id="cards"></div>
-  <div id="ver">V2.9</div>
+  <div id="ver">V4.0</div>
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <script>
     let bridge = null;
@@ -239,6 +239,10 @@ let 让位动画批次 = 0;
 // 坞外回坞动画 timer: 新拖拽启动时必须取消旧 setTimeout, 防止删掉新占位
 let 回坞定时器 = null;
 let 回坞批次 = 0;
+
+// V4.0: 拖拽持续跟手 — document 级鼠标坐标 + rAF 自循环, 解决快速移动脱手
+let _dragMX = 0, _dragMY = 0;
+let _dragRAF = null;
 
     /* ====================================================================
      * 第一组: 工具函数 - 半卡越线 / 可见占位 / FLIP 让位 / 跟手辅助
@@ -451,6 +455,32 @@ let 回坞批次 = 0;
       if (插入线元素) 插入线元素.style.display = 'none';
     }
 
+    /**
+     * V4.0: 文档级指针更新 (document 级 pointermove, 拖拽期间始终捕获最新鼠标坐标)
+     * 解决 Qt WebEngine 下快速移动时 pointermove 事件丢失导致卡片脱手的问题.
+     */
+    function 文档级指针更新(e) {
+      _dragMX = e.clientX;
+      _dragMY = e.clientY;
+    }
+
+    /**
+     * V4.0: 持续跟手循环 (rAF 自循环, 拖拽期间每帧更新卡片位置)
+     * 不再依赖 pointermove 事件驱动位置更新, 而是每帧读取最新已知鼠标坐标.
+     * 即使事件中断(鼠标太快离开元素), 恢复后也能立刻追上, 不会脱手.
+     */
+    function 持续跟手() {
+      if (!拖拽控制块) { _dragRAF = null; return; }
+      跟手移动(_dragMX, _dragMY);
+      if (点在坞内(_dragMX, _dragMY)) {
+        const dragCenterY = _dragMY - 拖拽控制块.offY + 拖拽控制块.baseRect.height / 2;
+        计算插入参考点(dragCenterY);
+      } else {
+        隐藏插入线();
+      }
+      _dragRAF = requestAnimationFrame(持续跟手);
+    }
+
     /* ====================================================================
      * 第二组: 核心函数 (12 个) - 拖拽生命周期
      * ==================================================================== */
@@ -506,6 +536,9 @@ let 回坞批次 = 0;
       隐藏插入线();
       让位动画批次++;
       清理让位动画残留();
+      // 9. V4.0: 持续跟手循环清理
+      document.removeEventListener('pointermove', 文档级指针更新);
+      if (_dragRAF) { cancelAnimationFrame(_dragRAF); _dragRAF = null; }
     }
 
     /**
@@ -546,6 +579,11 @@ let 回坞批次 = 0;
       dragLayer.appendChild(el);                              // 提到 drag-layer (fixed 全屏层)
       document.body.classList.add('dragging-now');            // 让 drag-layer 接管 pointer-events
       初始化插入线();
+      // V4.0: 启动持续跟手循环 (解决快速移动脱手)
+      _dragMX = 拖拽控制块.startX;
+      _dragMY = 拖拽控制块.startY;
+      document.addEventListener('pointermove', 文档级指针更新);
+      _dragRAF = requestAnimationFrame(持续跟手);
     }
 
     /**
@@ -634,6 +672,9 @@ let 回坞批次 = 0;
       renumber();
       const t = el.querySelector('.title');
       if (t) { ro.observe(t); const txt = t.querySelector('.txt'); if (txt) ro.observe(txt); }
+      // V4.0: 停止持续跟手循环
+      document.removeEventListener('pointermove', 文档级指针更新);
+      if (_dragRAF) { cancelAnimationFrame(_dragRAF); _dragRAF = null; }
       落点动画中 = false;
       el._suppress = true;
     }
@@ -699,11 +740,9 @@ let 回坞批次 = 0;
         拖拽控制块.moved = true;
         启动拖拽(el);
       }
-      最近移动事件 = e;
-      if (!是否已调度rAF) {
-        是否已调度rAF = true;
-        requestAnimationFrame(处理每帧移动);
-      }
+      // V4.0: 更新全局鼠标坐标 (持续跟手循环每帧读取, 不再依赖事件驱动 rAF)
+      _dragMX = e.clientX;
+      _dragMY = e.clientY;
     }
 
     /**
@@ -736,16 +775,17 @@ let 回坞批次 = 0;
      */
     function 处理抬起(el, e) {
       if (!拖拽控制块 || 拖拽控制块.el !== el) return;
-      // 兜底: rAF 调度了但没跑 (快速松手), 同步跑一次
-      if (拖拽控制块.moved && 是否已调度rAF) {
-        是否已调度rAF = false;
-        处理每帧移动();
-      }
+      // V4.0: 更新最终鼠标坐标 (持续跟手循环已保证位置最新, 此处只更新坐标变量)
+      _dragMX = e.clientX;
+      _dragMY = e.clientY;
       const wasMoved = 拖拽控制块.moved;
       const hwnd = 拖拽控制块.hwnd, cx = e.clientX, cy = e.clientY;
       try { el.releasePointerCapture(e.pointerId); } catch(_) {}
       if (卡死兜底定时器) { clearTimeout(卡死兜底定时器); 卡死兜底定时器 = null; }
       if (是否已调度rAF) { 是否已调度rAF = false; 最近移动事件 = null; }
+      // V4.0: 停止持续跟手循环
+      document.removeEventListener('pointermove', 文档级指针更新);
+      if (_dragRAF) { cancelAnimationFrame(_dragRAF); _dragRAF = null; }
       const dropIn = 点在坞内(cx, cy);
       const wEl = 拖拽控制块.el;
       拖拽控制块 = null;
@@ -772,6 +812,9 @@ let 回坞批次 = 0;
       try { el.releasePointerCapture(e.pointerId); } catch (_) {}
       if (卡死兜底定时器) { clearTimeout(卡死兜底定时器); 卡死兜底定时器 = null; }
       if (是否已调度rAF) { 是否已调度rAF = false; 最近移动事件 = null; }
+      // V4.0: 停止持续跟手循环
+      document.removeEventListener('pointermove', 文档级指针更新);
+      if (_dragRAF) { cancelAnimationFrame(_dragRAF); _dragRAF = null; }
       拖拽控制块 = null;
       隐藏插入线();
       if (!wasMoved) return;                             // 只是按下, 不应触发回坞
